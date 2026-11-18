@@ -1746,6 +1746,11 @@ impl ModelClientSession {
         Ok(current_items.cloned().collect())
     }
 
+    /// Require the next WebSocket request to send its full input.
+    pub(crate) fn clear_websocket_continuation(&mut self) {
+        self.websocket_session.last_response_rx = None;
+    }
+
     fn get_last_response(&mut self) -> Option<LastResponse> {
         self.websocket_session
             .last_response_rx

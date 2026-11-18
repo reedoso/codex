@@ -86,6 +86,167 @@ async fn uploaded_audio_survives_follow_up_and_resume() -> Result<()> {
     Ok(())
 }
 
+#[test_case(ToolMode::Direct, "function_call_output"; "function")]
+#[test_case(ToolMode::CodeMode, "custom_tool_call_output"; "code_mode")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_tool_audio_does_not_block_follow_up(
+    mode: ToolMode,
+    output_type: &str,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let call_id = "recording-call";
+    let call = if mode == ToolMode::CodeMode {
+        ev_custom_tool_call(
+            call_id,
+            "exec",
+            r#"audio(await tools.recording({})); text("recording caption");"#,
+        )
+    } else {
+        responses::ev_function_call(call_id, "recording", "{}")
+    };
+    let stream = |events| {
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(sse(events))
+    };
+    let mock = mount_response_sequence(
+        &server,
+        vec![
+            stream(vec![ev_response_created("r1"), call, ev_completed("r1")]),
+            wiremock::ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": null,
+                    "message": "Audio input is not available.",
+                    "param": "input"
+                }
+            })),
+            stream(vec![
+                ev_assistant_message("recovered", "The audio preview is unavailable."),
+                ev_completed("r2"),
+            ]),
+            stream(vec![
+                ev_assistant_message("follow_up", "Text still works."),
+                ev_completed("r3"),
+            ]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_config(move |config| {
+            config.allow_persistent_dynamic_tool_updates = true;
+            config.model_provider.stream_max_retries = Some(0);
+            assert!(
+                config
+                    .features
+                    .set_enabled(Feature::CodeMode, mode == ToolMode::CodeMode)
+                    .is_ok()
+            );
+            assert!(
+                config
+                    .features
+                    .set_enabled(Feature::FileBackedToolAudio, false)
+                    .is_ok()
+            );
+        })
+        .with_model_info_override("gpt-5.5", move |model| {
+            model.input_modalities.push(InputModality::Audio);
+            model.tool_mode = Some(mode);
+            model.use_responses_lite = mode == ToolMode::CodeMode;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    test.codex
+        .replace_dynamic_tools(vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+            name: "recording".into(),
+            description: "Return a recording.".into(),
+            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            defer_loading: false,
+        })])
+        .await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![text(
+            "Listen to the recording.",
+        )]))
+        .await?;
+    let request = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::DynamicToolCallRequest(call) => Some(call.clone()),
+        _ => None,
+    })
+    .await;
+    test.codex
+        .submit(Op::DynamicToolResponse {
+            id: request.call_id,
+            response: DynamicToolResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputAudio {
+                    audio_url: super::super::audio_truncation::pcm_wav_data_url(
+                        /*sample_count*/ 4_000,
+                    ),
+                }],
+                success: true,
+            },
+        })
+        .await?;
+    let completed = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(completed.error.is_none(), "{:?}", completed.error);
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![text(
+            "Can you still respond?",
+        )]))
+        .await?;
+    let completed = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(completed.error.is_none(), "{:?}", completed.error);
+
+    let is_tool_output =
+        |item: &serde_json::Value| item["type"] == output_type && item["call_id"] == call_id;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 4);
+    let read_output = |index: usize| {
+        requests[index]
+            .input()
+            .into_iter()
+            .find(is_tool_output)
+            .expect("matched tool result")["output"]
+            .clone()
+    };
+    let submitted = read_output(1);
+    let mut expected = submitted.clone();
+    let audio = expected
+        .as_array_mut()
+        .expect("multimodal tool result")
+        .iter_mut()
+        .find(|part| part["type"] == "input_audio")
+        .expect("original request included audio");
+    *audio = json!({
+        "type": "input_text",
+        "text": "audio content omitted because you do not support audio input"
+    });
+    assert_eq!(read_output(2), expected);
+    assert_eq!(read_output(3), expected);
+
+    let rollout = test.codex.rollout_path().expect("durable thread rollout");
+    test.codex.shutdown_and_wait().await?;
+    let history = std::fs::read_to_string(rollout)?;
+    let persisted = history
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|line| is_tool_output(&line["payload"]))
+        .expect("persisted tool result");
+    assert_eq!(persisted["payload"]["output"], submitted);
+    Ok(())
+}
+
 /// The model calls a registered tool directly or via Code Mode. Both persist the store's ID.
 #[test_case(ToolMode::Direct, "function_call_output", ThreadHistoryMode::Legacy; "function")]
 #[test_case(ToolMode::Direct, "function_call_output", ThreadHistoryMode::Paginated; "paginated function")]

@@ -1,4 +1,4 @@
-//! Non-mutating request projection for uploaded audio rejected by Responses.
+//! Non-mutating request projection for audio rejected by Responses.
 //! Provider errors are attributed only against the immutable submitted request.
 
 use std::collections::BTreeSet;
@@ -16,6 +16,56 @@ use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use futures::StreamExt;
 use futures::stream;
+
+/// The endpoint rejected tool audio despite the model catalog advertising support.
+pub(crate) fn tool_audio_was_rejected(error: &CodexErrorDetails) -> bool {
+    let CodexErrorDetails::InvalidRequest(body) = error else {
+        return false;
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let error = &body["error"];
+    error["type"] == "invalid_request_error"
+        && error["param"] == "input"
+        && error["message"] == "Audio input is not available."
+}
+
+/// Only retry if the submitted audio came from tools.
+pub(crate) fn has_only_tool_audio(items: &[ResponseItem]) -> bool {
+    let mut tool_audio = false;
+    for item in items {
+        match item {
+            ResponseItem::Message { content, .. }
+                if content
+                    .iter()
+                    .any(|part| matches!(part, ContentItem::InputAudio { .. })) =>
+            {
+                return false;
+            }
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => {
+                tool_audio |= output
+                    .content_items()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|part| matches!(part, FunctionCallOutputContentItem::InputAudio { .. }));
+            }
+            _ => {}
+        }
+    }
+    tool_audio
+}
+
+pub(crate) fn project_without_tool_audio(items: &mut [ResponseItem]) {
+    for item in items {
+        if let ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } = item
+        {
+            crate::context_manager::normalize::strip_audio_from_tool_output(output);
+        }
+    }
+}
 
 /// Exact file identity proven by a terminal provider error and its submitted request.
 #[derive(Clone)]

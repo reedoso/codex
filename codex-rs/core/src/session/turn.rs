@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -2060,6 +2061,14 @@ async fn run_sampling_request(
     let mut notify_messages = Vec::new();
     let mut executed_tool_calls_by_output = HashMap::new();
     let mut sampling_request = SamplingRequest::new(SamplingKind::Sampling);
+    let audio_route = (
+        turn_context.config.model_provider_id.clone(),
+        step_context.settings.model_info.slug.clone(),
+    );
+    let rejected_tool_audio = sess
+        .services
+        .thread_extension_data
+        .get_or_init(RejectedToolAudioRoutes::default);
     loop {
         // Running code-mode cells can request review while this response is in flight.
         // Keep the latest received ID until response.created replaces it.
@@ -2109,6 +2118,15 @@ async fn run_sampling_request(
             &sess.services.thread_extension_data,
             &mut prompt.tools,
         );
+        if rejected_tool_audio
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&audio_route)
+        {
+            rejected_audio::project_without_tool_audio(&mut prompt.input);
+        }
+        let has_only_tool_audio = rejected_audio::has_only_tool_audio(&prompt.input);
         let (submitted_audio, pending_audio) = {
             let model = &step_context.settings.model_info.slug;
             let provider = &turn_context.config.model_provider_id;
@@ -2134,6 +2152,7 @@ async fn run_sampling_request(
             (submitted, pending)
         };
         let mut draining_for_mailbox = false;
+        let mut rejected_before_response = false;
         let tool_cancellation = cancellation_token.child_token();
         let result = try_run_sampling_request(
             &mut sampling_request,
@@ -2150,6 +2169,7 @@ async fn run_sampling_request(
             cancellation_token.child_token(),
             &mut draining_for_mailbox,
             &tool_cancellation,
+            &mut rejected_before_response,
         )
         .await;
         if SamplingInterrupt::enabled(&turn_context) && tool_cancellation.is_cancelled() {
@@ -2176,6 +2196,21 @@ async fn run_sampling_request(
                 _ => err,
             },
         };
+
+        if rejected_before_response
+            && has_only_tool_audio
+            && !preempt.is_cancelled()
+            && !cancellation_token.is_cancelled()
+        {
+            rejected_tool_audio
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(audio_route.clone());
+            client_session.clear_websocket_continuation();
+            turn_context.turn_timing_state.record_sampling_retry();
+            continue;
+        }
 
         // A steer can preempt retry handling. Finish this terminal failure with the
         // identity from the submitted request before draining any new recordings.
@@ -2221,6 +2256,9 @@ async fn run_sampling_request(
         turn_context.turn_timing_state.record_sampling_retry();
     }
 }
+
+#[derive(Default)]
+struct RejectedToolAudioRoutes(Mutex<HashSet<(String, String)>>);
 
 pub(super) enum PreparedToolRecommendations {
     Endpoint(Vec<DiscoverableTool>),
@@ -3025,6 +3063,7 @@ async fn try_run_sampling_request(
     cancellation_token: CancellationToken,
     draining_for_mailbox: &mut bool,
     tool_cancellation: &CancellationToken,
+    rejected_before_response: &mut bool,
 ) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
     #[expect(deprecated, reason = "Classify feedback using the initial turn cwd.")]
@@ -3130,6 +3169,7 @@ async fn try_run_sampling_request(
             if interrupt_at_boundary {
                 SamplingInterrupt::unregister(&sess, &turn_context).await;
             }
+            *rejected_before_response = rejected_audio::tool_audio_was_rejected(error.details());
             return Err(error);
         }
     };
@@ -3179,6 +3219,7 @@ async fn try_run_sampling_request(
     let mut between_items = false;
     let mut stopping_tools = false;
     let mut completed_tools = Vec::new();
+    let mut response_started = false;
     let outcome: CodexResult<SamplingRequestResult> = loop {
         if response_completed && resampling.accepted_output.is_empty() {
             if resampling.update_usage_boundary {
@@ -3298,9 +3339,18 @@ async fn try_run_sampling_request(
                         last_agent_message,
                     });
                 }
+                *rejected_before_response =
+                    !response_started && rejected_audio::tool_audio_was_rejected(err.details());
                 break Err(err);
             }
         };
+        response_started |= !matches!(
+            &event,
+            ResponseEvent::ServerModel(_)
+                | ResponseEvent::ServerReasoningIncluded(_)
+                | ResponseEvent::RateLimits(_)
+                | ResponseEvent::ModelsEtag(_)
+        );
 
         // A steer can cut off unread items on an HTTP stream while the owner posts its bill.
         // Consume the terminal accounting decision before opening the follow-up request.
