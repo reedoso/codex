@@ -5,6 +5,7 @@ use super::*;
 use anyhow::Context as _;
 use codex_attachment_store::UploadContent;
 use codex_attachment_store::UploadRequest;
+use codex_config::config_toml::ResponseProcessMode;
 use codex_protocol::models::AudioReference;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -86,12 +87,14 @@ async fn uploaded_audio_survives_follow_up_and_resume() -> Result<()> {
     Ok(())
 }
 
-#[test_case(ToolMode::Direct, "function_call_output"; "function")]
-#[test_case(ToolMode::CodeMode, "custom_tool_call_output"; "code_mode")]
+#[test_case(ToolMode::Direct, "function_call_output", false; "function")]
+#[test_case(ToolMode::CodeMode, "custom_tool_call_output", false; "code_mode")]
+#[test_case(ToolMode::Direct, "function_call_output", true; "remote compaction")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_tool_audio_does_not_block_follow_up(
     mode: ToolMode,
     output_type: &str,
+    compact: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
@@ -110,30 +113,36 @@ async fn rejected_tool_audio_does_not_block_follow_up(
             .insert_header("content-type", "text/event-stream")
             .set_body_string(sse(events))
     };
-    let mock = mount_response_sequence(
-        &server,
-        vec![
-            stream(vec![ev_response_created("r1"), call, ev_completed("r1")]),
-            wiremock::ResponseTemplate::new(400).set_body_json(json!({
-                "error": {
-                    "type": "invalid_request_error",
-                    "code": null,
-                    "message": "Audio input is not available.",
-                    "param": "input"
-                }
-            })),
-            stream(vec![
-                ev_assistant_message("recovered", "The audio preview is unavailable."),
-                ev_completed("r2"),
-            ]),
-            stream(vec![
-                ev_assistant_message("follow_up", "Text still works."),
-                ev_completed("r3"),
-            ]),
-        ],
-    )
-    .await;
-    let test = test_codex()
+    let mut replies = vec![
+        stream(vec![ev_response_created("r1"), call, ev_completed("r1")]),
+        wiremock::ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": null,
+                "message": "Audio input is not available.",
+                "param": "input"
+            }
+        })),
+        stream(vec![
+            ev_assistant_message("recovered", "The audio preview is unavailable."),
+            ev_completed("r2"),
+        ]),
+        stream(vec![
+            ev_assistant_message("follow_up", "Text still works."),
+            ev_completed("r3"),
+        ]),
+    ];
+    if compact {
+        replies.push(stream(vec![
+            ev_response_created("compacted"),
+            json!({"type": "response.output_item.done", "item": {
+                "type": "compaction", "encrypted_content": "TOOL_AUDIO_CHECKPOINT"
+            }}),
+            ev_completed("compacted"),
+        ]));
+    }
+    let mock = mount_response_sequence(&server, replies).await;
+    let mut builder = test_codex()
         .with_config(move |config| {
             config.allow_persistent_dynamic_tool_updates = true;
             config.model_provider.stream_max_retries = Some(0);
@@ -154,9 +163,15 @@ async fn rejected_tool_audio_does_not_block_follow_up(
             model.input_modalities.push(InputModality::Audio);
             model.tool_mode = Some(mode);
             model.use_responses_lite = mode == ToolMode::CodeMode;
-        })
-        .build_with_auto_env(&server)
-        .await?;
+        });
+    if mode == ToolMode::CodeMode {
+        builder = builder
+            .with_code_mode_host_program(codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?);
+    }
+    if compact {
+        builder = builder.with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    }
+    let test = builder.build_with_auto_env(&server).await?;
     test.codex
         .replace_dynamic_tools(vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
             name: "recording".into(),
@@ -205,11 +220,15 @@ async fn rejected_tool_audio_does_not_block_follow_up(
     })
     .await;
     assert!(completed.error.is_none(), "{:?}", completed.error);
+    if compact {
+        test.codex.submit(Op::Compact).await?;
+        core_test_support::wait_for_successful_turn(&test.codex).await;
+    }
 
     let is_tool_output =
         |item: &serde_json::Value| item["type"] == output_type && item["call_id"] == call_id;
     let requests = mock.requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 4 + usize::from(compact));
     let read_output = |index: usize| {
         requests[index]
             .input()
@@ -232,6 +251,32 @@ async fn rejected_tool_audio_does_not_block_follow_up(
     });
     assert_eq!(read_output(2), expected);
     assert_eq!(read_output(3), expected);
+    if compact {
+        assert_eq!(requests[4].inputs_of_type("compaction_trigger").len(), 1);
+        assert_eq!(read_output(4), expected);
+        test.codex.flush_rollout().await?;
+        let history = test.codex.load_history(/*include_archived*/ false).await?;
+        let checkpoint = history.items.iter().find_map(|item| match item {
+            RolloutItem::Compacted(item)
+                if item.compaction_response_id.as_deref() == Some("compacted") =>
+            {
+                item.replacement_history.as_deref()
+            }
+            _ => None,
+        });
+        assert!(
+            checkpoint
+                .expect("compaction checkpoint")
+                .iter()
+                .any(|item| {
+                    matches!(item.item, ResponseItem::Compaction { .. })
+                        && item
+                            .metadata
+                            .as_ref()
+                            .is_some_and(|metadata| metadata.compaction_without_file_error_sources)
+                })
+        );
+    }
 
     let rollout = test.codex.rollout_path().expect("durable thread rollout");
     test.codex.shutdown_and_wait().await?;
@@ -244,6 +289,186 @@ async fn rejected_tool_audio_does_not_block_follow_up(
         .find(|line| is_tool_output(&line["payload"]))
         .expect("persisted tool result");
     assert_eq!(persisted["payload"]["output"], submitted);
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolAudioRejectionStage {
+    BeforeCreated,
+    AfterCreated,
+    AfterPartialOutput,
+}
+
+#[test_case(ResponseProcessMode::Streaming, ToolAudioRejectionStage::BeforeCreated; "streaming before created")]
+#[test_case(ResponseProcessMode::AfterCompleteResponse, ToolAudioRejectionStage::BeforeCreated; "buffered before created")]
+#[test_case(ResponseProcessMode::Streaming, ToolAudioRejectionStage::AfterCreated; "streaming after created")]
+#[test_case(ResponseProcessMode::AfterCompleteResponse, ToolAudioRejectionStage::AfterCreated; "buffered after created")]
+#[test_case(ResponseProcessMode::Streaming, ToolAudioRejectionStage::AfterPartialOutput; "streaming after partial output")]
+#[test_case(ResponseProcessMode::AfterCompleteResponse, ToolAudioRejectionStage::AfterPartialOutput; "buffered after partial output")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_tool_audio_websocket_respects_response_start(
+    mode: ResponseProcessMode,
+    stage: ToolAudioRejectionStage,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let call_id = "recording-call";
+    let mut tool_call = responses::ev_function_call(call_id, "recording", "{}");
+    tool_call["item"]["id"] = json!("fc_recording");
+    let recovery_expected = stage == ToolAudioRejectionStage::BeforeCreated;
+    let mut rejection = vec![json!({
+        "type": "response.metadata",
+        "headers": {"openai-model": "gpt-5.5"}
+    })];
+    if !recovery_expected {
+        rejection.push(ev_response_created("rejected"));
+    }
+    if stage == ToolAudioRejectionStage::AfterPartialOutput {
+        rejection.extend([
+            ev_message_item_added("msg_partial", ""),
+            ev_output_text_delta("Partial answer."),
+        ]);
+    }
+    rejection.push(json!({
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "param": "input",
+            "message": "Audio input is not available."
+        }
+    }));
+    let server = responses::start_websocket_server(vec![
+        vec![
+            vec![ev_response_created("warmup"), ev_completed("warmup")],
+            vec![
+                ev_response_created("tool-response"),
+                tool_call,
+                ev_completed("tool-response"),
+            ],
+            rejection,
+        ],
+        vec![vec![
+            ev_response_created("recovered"),
+            ev_assistant_message("msg_recovered", "The audio preview is unavailable."),
+            ev_completed("recovered"),
+        ]],
+    ])
+    .await;
+    let test = test_codex()
+        .with_config(move |config| {
+            config.allow_persistent_dynamic_tool_updates = true;
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            config.response_process_mode = mode;
+            config
+                .features
+                .disable(Feature::FileBackedToolAudio)
+                .expect("return inline audio");
+        })
+        .with_model_info_override("gpt-5.5", |model| {
+            model.input_modalities.push(InputModality::Audio);
+            model.tool_mode = Some(ToolMode::Direct);
+        })
+        .build_with_websocket_server(&server)
+        .await?;
+    test.codex
+        .replace_dynamic_tools(vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+            name: "recording".into(),
+            description: "Return a recording.".into(),
+            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            defer_loading: false,
+        })])
+        .await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![text(
+            "Listen to the recording.",
+        )]))
+        .await?;
+    let request = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::DynamicToolCallRequest(call) => Some(call.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(request.call_id, call_id);
+    let audio_url = super::super::audio_truncation::pcm_wav_data_url(/*sample_count*/ 4_000);
+    test.codex
+        .submit(Op::DynamicToolResponse {
+            id: request.call_id,
+            response: DynamicToolResponse {
+                content_items: vec![
+                    DynamicToolCallOutputContentItem::InputAudio { audio_url },
+                    DynamicToolCallOutputContentItem::InputText {
+                        text: "Recording caption.".into(),
+                    },
+                ],
+                success: true,
+            },
+        })
+        .await?;
+    let completed = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::DynamicToolCallRequest(call) => panic!("re-executed tool call {}", call.call_id),
+        EventMsg::TurnComplete(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+
+    test.codex.shutdown_and_wait().await?;
+    let connections = server.connections();
+    assert_eq!(
+        connections.iter().map(Vec::len).collect::<Vec<_>>(),
+        if recovery_expected {
+            vec![3, 1]
+        } else {
+            vec![3]
+        }
+    );
+    assert_eq!(connections[0][0].body_json()["generate"], false);
+    let rejected = connections[0][2].body_json();
+    assert_eq!(rejected["previous_response_id"], "tool-response");
+    let output_for_call = |request: &serde_json::Value| {
+        request["input"]
+            .as_array()
+            .expect("request input")
+            .iter()
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+            .expect("recording result")
+            .clone()
+    };
+    let mut expected = output_for_call(&rejected);
+    assert_eq!(expected["output"][0]["type"], "input_audio");
+    assert_eq!(
+        expected["output"][1],
+        json!({"type": "input_text", "text": "Recording caption."})
+    );
+    if recovery_expected {
+        assert!(completed.error.is_none(), "{completed:?}");
+        assert_eq!(
+            completed.last_agent_message.as_deref(),
+            Some("The audio preview is unavailable.")
+        );
+        let retry = connections[1][0].body_json();
+        assert_eq!(retry["type"], "response.create");
+        assert_eq!(retry.get("previous_response_id"), None);
+        assert!(
+            retry["input"]
+                .as_array()
+                .expect("retry input")
+                .iter()
+                .any(|item| { item["type"] == "function_call" && item["call_id"] == call_id })
+        );
+        expected["output"][0] = json!({
+            "type": "input_text",
+            "text": "audio content omitted because you do not support audio input"
+        });
+        assert_eq!(output_for_call(&retry), expected);
+    } else {
+        let error = completed.error.expect("late rejection must fail the turn");
+        assert!(
+            error.message.contains("Audio input is not available."),
+            "{error:?}"
+        );
+    }
+    server.shutdown().await;
     Ok(())
 }
 

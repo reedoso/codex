@@ -44,6 +44,7 @@ pub(super) struct RemoteCompactV2Attempt {
     pub(super) trace_input_history: Option<Vec<ResponseItem>>,
     pub(super) prompt_input: Vec<ResponseItem>,
     pub(super) prompt_input_metadata: Vec<Option<CodexHarnessMetadata>>,
+    pub(super) compaction_without_file_error_sources: bool,
     pub(super) compaction_output: ResponseItem,
     pub(super) compaction_response_id: String,
     pub(super) token_usage: Option<TokenUsage>,
@@ -208,29 +209,39 @@ pub(super) async fn run_remote_compact_v2_attempt(
         }
     };
     responses_metadata.tool_namespaces_info = tool_router.tool_namespaces_info().cloned();
-    // The file may disappear after the availability check, or the store may
-    // defer validation to Responses. Retry only an unambiguously rejected ID.
-    let mut submitted_audio = rejected_audio::SubmittedFileAudio::from_request(
-        &prompt.input,
-        /*accepted*/ None,
-        prompt
-            .input
-            .iter()
-            .zip(&prompt_input_metadata)
-            .filter_map(|(item, metadata)| {
-                rejected_audio::clear_checkpoint(item, metadata.as_ref())
-            }),
-    );
-    let RemoteCompactionV2Output {
-        compaction_output,
-        response_id,
-        token_usage,
-    } = loop {
+    let mut may_retry_file_audio = true;
+    let (output, compaction_without_file_error_sources) = loop {
         Arc::make_mut(&mut prompt)
             .input
             .push(ResponseItem::CompactionTrigger {});
+        // Installation retains client-owned items from the canonical prompt.
+        let mut wire_prompt = Arc::clone(&prompt);
+        if rejected_audio::tool_audio_is_rejected(
+            &sess.services.thread_extension_data,
+            &turn_context.config.model_provider_id,
+            &model_info.slug,
+        ) {
+            rejected_audio::project_without_tool_audio(&mut Arc::make_mut(&mut wire_prompt).input);
+        }
+        // A file may disappear after the availability check. Retry only an
+        // unambiguously rejected ID from the request actually sent.
+        let submitted_audio = if may_retry_file_audio {
+            rejected_audio::SubmittedFileAudio::from_request(
+                &wire_prompt.input,
+                /*accepted*/ None,
+                wire_prompt
+                    .input
+                    .iter()
+                    .zip(&prompt_input_metadata)
+                    .filter_map(|(item, metadata)| {
+                        rejected_audio::clear_checkpoint(item, metadata.as_ref())
+                    }),
+            )
+        } else {
+            None
+        };
         // A retry can edit its input while the worker still holds this attempt's snapshot.
-        let trace_prompt = Arc::clone(&prompt);
+        let trace_prompt = Arc::clone(&wire_prompt);
         let trace_model = model_info.slug.clone();
         let trace_attempt = compaction_trace.start_attempt(move || {
             serde_json::json!({
@@ -244,7 +255,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
             request,
             sess,
             step_context,
-            &prompt,
+            &wire_prompt,
             &responses_metadata,
             &mut transport,
             submitted_audio.as_ref(),
@@ -256,17 +267,32 @@ pub(super) async fn run_remote_compact_v2_attempt(
                 .map(|output| std::slice::from_ref(&output.compaction_output)),
         );
         let rejected_id = match compaction_output_result {
-            Ok(output) => break output,
+            Ok(output) => {
+                // Exclude the request-only trigger, which has no history metadata.
+                let wire_input = &wire_prompt.input[..wire_prompt.input.len() - 1];
+                let no_file_error_sources =
+                    rejected_audio::checkpoint_input_has_no_file_error_sources(
+                        wire_input,
+                        &prompt_input_metadata,
+                    );
+                break (output, no_file_error_sources);
+            }
             Err(error) => submitted_audio
-                .take()
                 .and_then(|audio| audio.rejected_file_id(error.details()))
                 .ok_or(error)?,
         };
+        may_retry_file_audio = false;
+        drop(wire_prompt);
         unavailable.insert(rejected_id);
         let input = &mut Arc::make_mut(&mut prompt).input;
         input.pop();
         rejected_audio::project_compaction_audio(input, &mut prompt_input_metadata, &unavailable);
     };
+    let RemoteCompactionV2Output {
+        compaction_output,
+        response_id,
+        token_usage,
+    } = output;
     let mut prompt_input = Arc::unwrap_or_clone(prompt).input;
     prompt_input.pop(); // Exclude the request-only trigger from checkpoint history.
     Ok(RemoteCompactV2Attempt {
@@ -275,6 +301,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         trace_input_history,
         prompt_input,
         prompt_input_metadata,
+        compaction_without_file_error_sources,
         compaction_output,
         compaction_response_id: response_id,
         token_usage,
