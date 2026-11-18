@@ -1,0 +1,29 @@
+name: Full Codex tests for audio recovery
+on:
+  push:
+    branches: [ci/audio-recovery-full-tests]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-bazel-ci
+        with:
+          target: x86_64-unknown-linux-gnu
+          cache-scope: audio-recovery-full-linux
+      - name: Resolve compatibility-test releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          releases="$(python3 .github/scripts/resolve_exec_server_releases.py)"
+          echo "CODEX_COMPAT_RELEASES=$releases" >> "$GITHUB_ENV"
+      - name: Run all ordinary Bazel test targets
+        run: |
+          ./.github/scripts/run-bazel-ci.sh --print-failed-action-summary --print-failed-test-logs \
+            -- test --test_tag_filters=-argument-comment-lint --test_verbose_timeout_warnings \
+            --build_metadata=COMMIT_SHA="${GITHUB_SHA}" -- //... -//third_party/v8:all
