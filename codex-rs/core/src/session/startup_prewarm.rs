@@ -19,6 +19,7 @@ use tracing::instrument;
 use tracing::warn;
 
 use crate::client::ModelClientSession;
+use crate::context_manager::rejected_audio;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::INITIAL_SUBMIT_ID;
 use crate::session::RequestEffortUsage;
@@ -479,6 +480,13 @@ async fn schedule_startup_prewarm_inner(
             .services
             .executed_tool_calls
             .attach_to_prompt(&mut history, &mut HashMap::new());
+        if rejected_audio::tool_audio_is_rejected(
+            &session.services.thread_extension_data,
+            &step_context.turn.config.model_provider_id,
+            &step_context.settings.model_info.slug,
+        ) {
+            rejected_audio::project_without_tool_audio(&mut history);
+        }
         history
     } else {
         Vec::new()

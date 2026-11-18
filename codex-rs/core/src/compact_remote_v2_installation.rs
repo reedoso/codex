@@ -199,6 +199,7 @@ async fn build_and_install_compaction(
         trace_input_history,
         prompt_input,
         prompt_input_metadata,
+        compaction_without_file_error_sources,
         compaction_output,
         compaction_response_id,
         token_usage,
@@ -213,6 +214,7 @@ async fn build_and_install_compaction(
         prompt_input,
         prompt_input_metadata,
         compaction_output,
+        compaction_without_file_error_sources,
         sess.features().get(),
         if sess.enabled(Feature::CompactionImageBudget) {
             RetainedImageBudget::Enabled

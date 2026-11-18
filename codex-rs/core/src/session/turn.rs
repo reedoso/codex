@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -2061,14 +2060,9 @@ async fn run_sampling_request(
     let mut notify_messages = Vec::new();
     let mut executed_tool_calls_by_output = HashMap::new();
     let mut sampling_request = SamplingRequest::new(SamplingKind::Sampling);
-    let audio_route = (
-        turn_context.config.model_provider_id.clone(),
-        step_context.settings.model_info.slug.clone(),
-    );
-    let rejected_tool_audio = sess
-        .services
-        .thread_extension_data
-        .get_or_init(RejectedToolAudioRoutes::default);
+    let model = &step_context.settings.model_info.slug;
+    let provider = &turn_context.config.model_provider_id;
+    let thread_store = &sess.services.thread_extension_data;
     loop {
         // Running code-mode cells can request review while this response is in flight.
         // Keep the latest received ID until response.created replaces it.
@@ -2118,18 +2112,11 @@ async fn run_sampling_request(
             &sess.services.thread_extension_data,
             &mut prompt.tools,
         );
-        if rejected_tool_audio
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&audio_route)
-        {
+        if rejected_audio::tool_audio_is_rejected(thread_store, provider, model) {
             rejected_audio::project_without_tool_audio(&mut prompt.input);
         }
         let has_only_tool_audio = rejected_audio::has_only_tool_audio(&prompt.input);
         let (submitted_audio, pending_audio) = {
-            let model = &step_context.settings.model_info.slug;
-            let provider = &turn_context.config.model_provider_id;
             let history = sess.clone_history().await;
             let accepted = history
                 .retained_context()
@@ -2202,11 +2189,7 @@ async fn run_sampling_request(
             && !preempt.is_cancelled()
             && !cancellation_token.is_cancelled()
         {
-            rejected_tool_audio
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(audio_route.clone());
+            rejected_audio::record_tool_audio_rejection(thread_store, provider, model);
             client_session.clear_websocket_continuation();
             turn_context.turn_timing_state.record_sampling_retry();
             continue;
@@ -2256,9 +2239,6 @@ async fn run_sampling_request(
         turn_context.turn_timing_state.record_sampling_retry();
     }
 }
-
-#[derive(Default)]
-struct RejectedToolAudioRoutes(Mutex<HashSet<(String, String)>>);
 
 pub(super) enum PreparedToolRecommendations {
     Endpoint(Vec<DiscoverableTool>),
@@ -3219,7 +3199,6 @@ async fn try_run_sampling_request(
     let mut between_items = false;
     let mut stopping_tools = false;
     let mut completed_tools = Vec::new();
-    let mut response_started = false;
     let outcome: CodexResult<SamplingRequestResult> = loop {
         if response_completed && resampling.accepted_output.is_empty() {
             if resampling.update_usage_boundary {
@@ -3339,18 +3318,11 @@ async fn try_run_sampling_request(
                         last_agent_message,
                     });
                 }
-                *rejected_before_response =
-                    !response_started && rejected_audio::tool_audio_was_rejected(err.details());
+                *rejected_before_response = !stream.response_started.load(Ordering::Acquire)
+                    && rejected_audio::tool_audio_was_rejected(err.details());
                 break Err(err);
             }
         };
-        response_started |= !matches!(
-            &event,
-            ResponseEvent::ServerModel(_)
-                | ResponseEvent::ServerReasoningIncluded(_)
-                | ResponseEvent::RateLimits(_)
-                | ResponseEvent::ModelsEtag(_)
-        );
 
         // A steer can cut off unread items on an HTTP stream while the owner posts its bill.
         // Consume the terminal accounting decision before opening the follow-up request.

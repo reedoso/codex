@@ -182,6 +182,8 @@ pub(crate) struct SamplingStream {
     pub(crate) consumer_dropped: CancellationToken,
     /// Once settlement begins, a steer waits for its terminal accounting decision.
     pub(crate) settlement_started: Arc<std::sync::atomic::AtomicBool>,
+    /// The provider began responding, even if its events were buffered or discarded.
+    pub(crate) response_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SamplingStream {

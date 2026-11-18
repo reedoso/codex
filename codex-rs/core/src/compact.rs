@@ -17,6 +17,7 @@ use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context::world_state::split_prefix_updates;
 use crate::context_manager::ContextManager;
+use crate::context_manager::rejected_audio;
 use crate::context_manager::updates::merge_world_state_updates;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -319,6 +320,13 @@ async fn run_compact_task_inner_impl(
         sess.services
             .executed_tool_calls
             .attach_to_compaction_prompt(&mut turn_input);
+        if rejected_audio::tool_audio_is_rejected(
+            &sess.services.thread_extension_data,
+            &turn_context.config.model_provider_id,
+            &turn_context.model_info().slug,
+        ) {
+            rejected_audio::project_without_tool_audio(&mut turn_input);
+        }
         let turn_input_len = turn_input.len();
         let base_instructions = if turn_input
             .iter()

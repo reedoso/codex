@@ -21,6 +21,7 @@ pub(super) struct ResponseDelivery {
     attempt: Option<SamplingAttempt>,
     held: Vec<ResponseEvent>,
     pub(super) settlement_started: Arc<AtomicBool>,
+    pub(super) response_started: Arc<AtomicBool>,
     settlement: Option<(
         Arc<crate::session::session::Session>,
         Arc<crate::session::turn_context::TurnContext>,
@@ -39,6 +40,7 @@ impl ResponseDelivery {
             attempt: attempt.take(),
             held: Vec::new(),
             settlement_started: Default::default(),
+            response_started: Default::default(),
             settlement,
         }
     }
