@@ -1746,6 +1746,11 @@ impl ModelClientSession {
         Ok(current_items.cloned().collect())
     }
 
+    /// Require the next WebSocket request to send its full input.
+    pub(crate) fn clear_websocket_continuation(&mut self) {
+        self.websocket_session.last_response_rx = None;
+    }
+
     fn get_last_response(&mut self) -> Option<LastResponse> {
         self.websocket_session
             .last_response_rx
@@ -2874,10 +2879,33 @@ impl OpenedModelResponse {
         let routing_affinity = self.stream.routing_affinity.take();
         let request_id = self.stream.upstream_request_id.take();
         let interrupt = self.stream.interrupt.take();
+        // Interceptors may buffer or suppress events that establish response start.
+        let response_started = Arc::clone(&delivery.response_started);
+        let mut saw_start = false;
+        let provider_stream = self.stream.inspect(move |event| {
+            if !saw_start
+                && matches!(
+                    event,
+                    Ok(ResponseEvent::Created { .. }
+                        | ResponseEvent::OutputItemAdded(_)
+                        | ResponseEvent::OutputItemDone(_)
+                        | ResponseEvent::OutputTextDelta(_)
+                        | ResponseEvent::ToolCallInputDelta { .. }
+                        | ResponseEvent::ReasoningSummaryDelta { .. }
+                        | ResponseEvent::ReasoningSummaryDone { .. }
+                        | ResponseEvent::ReasoningContentDelta { .. }
+                        | ResponseEvent::ReasoningSummaryPartAdded { .. }
+                        | ResponseEvent::Completed { .. })
+                )
+            {
+                saw_start = true;
+                response_started.store(true, Ordering::Release);
+            }
+        });
         // A response interceptor can hold even the first token until completion. Measure
         // ordinary turn TTFT on the decoded provider stream, before any such wait.
         let provider_stream = if let Some(turn) = sampling_turn {
-            futures::stream::unfold((self.stream, turn), |(mut stream, turn)| async move {
+            futures::stream::unfold((provider_stream, turn), |(mut stream, turn)| async move {
                 let event = stream.next().await?;
                 if let Ok(event) = &event {
                     crate::turn_timing::record_turn_ttft_metric(&turn, event).await;
@@ -2886,7 +2914,7 @@ impl OpenedModelResponse {
             })
             .boxed()
         } else {
-            self.stream.boxed()
+            provider_stream.boxed()
         };
         let events = crate::model_request::intercept_stream(provider_stream, self.interceptors);
         let mut stream = map_response_events(
@@ -2923,6 +2951,7 @@ where
     let consumer_dropped = CancellationToken::new();
     let consumer_dropped_for_stream = consumer_dropped.clone();
     let settlement_started = Arc::clone(&delivery.settlement_started);
+    let response_started = Arc::clone(&delivery.response_started);
     let provider = Arc::clone(&client.provider);
     let item_id_generator = Arc::clone(&client.item_id_generator);
 
@@ -3095,6 +3124,7 @@ where
         interrupt: None,
         consumer_dropped: consumer_dropped_for_stream,
         settlement_started,
+        response_started,
     }
 }
 

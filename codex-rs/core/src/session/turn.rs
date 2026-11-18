@@ -2060,6 +2060,9 @@ async fn run_sampling_request(
     let mut notify_messages = Vec::new();
     let mut executed_tool_calls_by_output = HashMap::new();
     let mut sampling_request = SamplingRequest::new(SamplingKind::Sampling);
+    let model = &step_context.settings.model_info.slug;
+    let provider = &turn_context.config.model_provider_id;
+    let thread_store = &sess.services.thread_extension_data;
     loop {
         // Running code-mode cells can request review while this response is in flight.
         // Keep the latest received ID until response.created replaces it.
@@ -2109,9 +2112,11 @@ async fn run_sampling_request(
             &sess.services.thread_extension_data,
             &mut prompt.tools,
         );
+        if rejected_audio::tool_audio_is_rejected(thread_store, provider, model) {
+            rejected_audio::project_without_tool_audio(&mut prompt.input);
+        }
+        let has_only_tool_audio = rejected_audio::has_only_tool_audio(&prompt.input);
         let (submitted_audio, pending_audio) = {
-            let model = &step_context.settings.model_info.slug;
-            let provider = &turn_context.config.model_provider_id;
             let history = sess.clone_history().await;
             let accepted = history
                 .retained_context()
@@ -2134,6 +2139,7 @@ async fn run_sampling_request(
             (submitted, pending)
         };
         let mut draining_for_mailbox = false;
+        let mut rejected_before_response = false;
         let tool_cancellation = cancellation_token.child_token();
         let result = try_run_sampling_request(
             &mut sampling_request,
@@ -2150,6 +2156,7 @@ async fn run_sampling_request(
             cancellation_token.child_token(),
             &mut draining_for_mailbox,
             &tool_cancellation,
+            &mut rejected_before_response,
         )
         .await;
         if SamplingInterrupt::enabled(&turn_context) && tool_cancellation.is_cancelled() {
@@ -2176,6 +2183,17 @@ async fn run_sampling_request(
                 _ => err,
             },
         };
+
+        if rejected_before_response
+            && has_only_tool_audio
+            && !preempt.is_cancelled()
+            && !cancellation_token.is_cancelled()
+        {
+            rejected_audio::record_tool_audio_rejection(thread_store, provider, model);
+            client_session.clear_websocket_continuation();
+            turn_context.turn_timing_state.record_sampling_retry();
+            continue;
+        }
 
         // A steer can preempt retry handling. Finish this terminal failure with the
         // identity from the submitted request before draining any new recordings.
@@ -3025,6 +3043,7 @@ async fn try_run_sampling_request(
     cancellation_token: CancellationToken,
     draining_for_mailbox: &mut bool,
     tool_cancellation: &CancellationToken,
+    rejected_before_response: &mut bool,
 ) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
     #[expect(deprecated, reason = "Classify feedback using the initial turn cwd.")]
@@ -3130,6 +3149,7 @@ async fn try_run_sampling_request(
             if interrupt_at_boundary {
                 SamplingInterrupt::unregister(&sess, &turn_context).await;
             }
+            *rejected_before_response = rejected_audio::tool_audio_was_rejected(error.details());
             return Err(error);
         }
     };
@@ -3298,6 +3318,8 @@ async fn try_run_sampling_request(
                         last_agent_message,
                     });
                 }
+                *rejected_before_response = !stream.response_started.load(Ordering::Acquire)
+                    && rejected_audio::tool_audio_was_rejected(err.details());
                 break Err(err);
             }
         };

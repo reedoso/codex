@@ -558,6 +558,7 @@ fn build_v2_compacted_history(
     prompt_input: Vec<ResponseItem>,
     prompt_input_metadata: Vec<Option<CodexHarnessMetadata>>,
     compaction_output: ResponseItem,
+    compaction_without_file_error_sources: bool,
     features: &Features,
     image_budget: RetainedImageBudget,
     audio_durations: &FileAudioDurations,
@@ -568,10 +569,6 @@ fn build_v2_compacted_history(
         .zip(prompt_input_metadata)
         .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
         .collect::<Vec<_>>();
-    let no_file_error_sources =
-        crate::context_manager::rejected_audio::checkpoint_input_has_no_file_error_sources(
-            &prompt_input,
-        );
     let pending_sequence = crate::compact_pending_input::pending_mail_sequence(&prompt_input);
     let retained = select_retained_items(
         &prompt_input,
@@ -590,7 +587,7 @@ fn build_v2_compacted_history(
         .map(|envelope| retained_input_image_count(&envelope.item))
         .sum::<usize>();
     let mut checkpoint = ResponseItemEnvelope::new(compaction_output);
-    if no_file_error_sources {
+    if compaction_without_file_error_sources {
         checkpoint
             .metadata
             .get_or_insert_default()
@@ -990,10 +987,15 @@ mod tests {
         output: ResponseItem,
     ) -> (Vec<ResponseItemEnvelope>, usize) {
         let metadata = vec![None; input.len()];
+        let no_file_error_sources =
+            crate::context_manager::rejected_audio::checkpoint_input_has_no_file_error_sources(
+                &input, &metadata,
+            );
         build_v2_compacted_history(
             input,
             metadata,
             output,
+            no_file_error_sources,
             &Features::with_defaults(),
             RetainedImageBudget::Disabled,
             &FileAudioDurations::default(),
@@ -1033,6 +1035,7 @@ mod tests {
             interrupt: None,
             consumer_dropped: CancellationToken::new(),
             settlement_started: Default::default(),
+            response_started: Default::default(),
         }
     }
 
@@ -1125,6 +1128,7 @@ mod tests {
                     None,
                 ],
                 output.clone(),
+                /*compaction_without_file_error_sources*/ true,
                 &features,
                 RetainedImageBudget::Disabled,
                 &FileAudioDurations::default(),

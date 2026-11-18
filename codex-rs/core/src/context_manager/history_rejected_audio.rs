@@ -1,10 +1,15 @@
-//! Non-mutating request projection for uploaded audio rejected by Responses.
+//! Non-mutating request projection for audio rejected by Responses.
 //! Provider errors are attributed only against the immutable submitted request.
 
 use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 
 use codex_attachment_store::AttachmentStore;
+use codex_extension_api::ExtensionData;
 use codex_history::AcceptedFileAudio;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
@@ -16,6 +21,87 @@ use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use futures::StreamExt;
 use futures::stream;
+
+#[derive(Default)]
+struct RejectedToolAudioRoutes(Mutex<HashMap<String, HashSet<String>>>);
+
+pub(crate) fn tool_audio_is_rejected(
+    thread_store: &ExtensionData,
+    provider: &str,
+    model: &str,
+) -> bool {
+    thread_store
+        .get::<RejectedToolAudioRoutes>()
+        .is_some_and(|routes| {
+            routes
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(provider)
+                .is_some_and(|models| models.contains(model))
+        })
+}
+
+pub(crate) fn record_tool_audio_rejection(
+    thread_store: &ExtensionData,
+    provider: &str,
+    model: &str,
+) {
+    thread_store
+        .get_or_init(RejectedToolAudioRoutes::default)
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(provider.to_owned())
+        .or_default()
+        .insert(model.to_owned());
+}
+
+/// The endpoint rejected tool audio despite the model catalog advertising support.
+pub(crate) fn tool_audio_was_rejected(error: &CodexErrorDetails) -> bool {
+    let CodexErrorDetails::InvalidRequest(body) = error else {
+        return false;
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let error = &body["error"];
+    error["type"] == "invalid_request_error"
+        && error["param"] == "input"
+        && error["message"] == "Audio input is not available."
+}
+
+/// Only retry if the submitted audio came from tools.
+pub(crate) fn has_only_tool_audio(items: &[ResponseItem]) -> bool {
+    let mut tool_audio = false;
+    for item in items {
+        match item {
+            ResponseItem::Message { content, .. }
+                if content
+                    .iter()
+                    .any(|part| matches!(part, ContentItem::InputAudio { .. })) =>
+            {
+                return false;
+            }
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => {
+                tool_audio |= output.contains_audio();
+            }
+            _ => {}
+        }
+    }
+    tool_audio
+}
+
+pub(crate) fn project_without_tool_audio(items: &mut [ResponseItem]) {
+    for item in items {
+        if let ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } = item
+        {
+            crate::context_manager::normalize::strip_audio_from_tool_output(output);
+        }
+    }
+}
 
 /// Exact file identity proven by a terminal provider error and its submitted request.
 #[derive(Clone)]
@@ -108,12 +194,16 @@ fn visit_sources<'a>(item: &'a ResponseItem, mut visit: impl FnMut(FileErrorSour
 }
 
 /// Older opaque checkpoints carry no provenance and continue to compete for attribution.
-pub(crate) fn checkpoint_input_has_no_file_error_sources(items: &[ResponseItemEnvelope]) -> bool {
-    items.iter().all(|envelope| {
+pub(crate) fn checkpoint_input_has_no_file_error_sources(
+    items: &[ResponseItem],
+    metadata: &[Option<CodexHarnessMetadata>],
+) -> bool {
+    debug_assert_eq!(items.len(), metadata.len());
+    items.iter().zip(metadata).all(|(item, metadata)| {
         let mut clear = true;
-        visit_sources(&envelope.item, |source| {
+        visit_sources(item, |source| {
             clear &= matches!(source, FileErrorSource::Opaque)
-                && clear_checkpoint(&envelope.item, envelope.metadata.as_ref()).is_some();
+                && clear_checkpoint(item, metadata.as_ref()).is_some();
         });
         clear
     })

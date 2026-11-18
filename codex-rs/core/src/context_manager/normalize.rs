@@ -414,18 +414,22 @@ pub(crate) fn strip_audio_when_unsupported(
             }
             ResponseItem::FunctionCallOutput { output, .. }
             | ResponseItem::CustomToolCallOutput { output, .. } => {
-                if let Some(content_items) = output.content_items_mut() {
-                    for content_item in content_items.iter_mut() {
-                        if matches!(
-                            content_item,
-                            FunctionCallOutputContentItem::InputAudio { .. }
-                        ) {
-                            *content_item = UnsupportedMedia::AUDIO.render().into();
-                        }
-                    }
-                }
+                strip_audio_from_tool_output(output);
             }
             _ => {}
+        }
+    }
+}
+
+pub(super) fn strip_audio_from_tool_output(output: &mut FunctionCallOutputPayload) {
+    if let Some(content_items) = output.content_items_mut() {
+        for content_item in content_items {
+            if matches!(
+                content_item,
+                FunctionCallOutputContentItem::InputAudio { .. }
+            ) {
+                *content_item = UnsupportedMedia::AUDIO.render().into();
+            }
         }
     }
 }
