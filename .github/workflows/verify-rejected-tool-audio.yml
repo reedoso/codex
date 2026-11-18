@@ -24,4 +24,8 @@ jobs:
       - run: rustup toolchain install 1.99.1 --profile minimal
       - name: Run Codex audio recovery regression tests
         working-directory: codex-rs
-        run: cargo +1.99.1 test --locked -p codex-core --test all rejected_tool_audio_does_not_block_follow_up
+        run: |
+          cargo +1.99.1 build --locked -p codex-code-mode-host
+          export CARGO_BIN_EXE_codex_code_mode_host="$PWD/target/debug/codex-code-mode-host"
+          test -x "$CARGO_BIN_EXE_codex_code_mode_host"
+          cargo +1.99.1 test --locked -p codex-core --test all rejected_tool_audio_does_not_block_follow_up
