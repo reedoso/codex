@@ -13,6 +13,7 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_BACKTRACE: '1'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -28,4 +29,4 @@ jobs:
           cargo +1.99.1 build --locked -p codex-code-mode-host
           export CARGO_BIN_EXE_codex_code_mode_host="$PWD/target/debug/codex-code-mode-host"
           test -x "$CARGO_BIN_EXE_codex_code_mode_host"
-          cargo +1.99.1 test --locked -p codex-core --test all rejected_tool_audio_does_not_block_follow_up
+          cargo +1.99.1 test --locked -p codex-core --test all suite::scenarios::audio_file:: -- --nocapture
